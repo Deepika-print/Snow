@@ -1,0 +1,9 @@
+groq
+gradio
+requests
+beautifulsoup4
+python-dotenv
+duckduckgo-search
+python-telegram-bot
+flask
+twilio
