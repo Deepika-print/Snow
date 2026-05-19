@@ -1,92 +1,120 @@
 import json
 import os
+import re
 from groq import Groq
 from tools import TOOLS, TOOL_MAP
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Use only models that reliably support tool calling
 GROQ_MODEL = "llama-3.3-70b-versatile"
+MAX_ITERATIONS = 8
+MAX_TASK_LENGTH = 2000
 
-MAX_ITERATIONS = 10
+BLOCKED_PATTERNS = [
+    r"ignore (previous|all) instructions",
+    r"you are now", r"pretend you are",
+    r"jailbreak", r"dan mode",
+]
 
-SYSTEM_PROMPT = """You are Snow, an autonomous AI agent — powerful, precise, and proactive.
+SYSTEM_PROMPT = """You are Snow, a helpful and precise AI assistant.
 
-You have access to these tools:
-- web_search: search the internet for any information
-- scrape_webpage: read full content of any webpage
-- run_python: execute Python code for calculations, data processing, automation
-- run_shell: run system commands
-- read_file / write_file / list_files: work with the filesystem
+You have access to tools. Use them to answer questions accurately.
 
-## How you work:
-1. Analyze the user's task carefully
-2. Break it into steps
-3. Use tools to complete each step — don't guess, look things up
-4. Loop until the task is fully done
-5. Give a clear, well-formatted final answer
+IMPORTANT: Always give a complete, detailed final answer. Never say just "task completed" - actually answer the question with the information you found.
 
-## Rules:
-- Always use tools when you need real information — never make things up
-- After web_search, use scrape_webpage on the best result to get full details
-- When writing reports or files, write them properly and confirm the file was saved
-- Be thorough but efficient — don't use more tool calls than needed
-- Format your final answer clearly with headers, bullets, and structure
+For any factual question, use web_search to find the answer, then provide a comprehensive response."""
 
-You are capable of completing complex multi-step tasks autonomously. Be confident and thorough."""
+
+def validate_task(task):
+    if not task or not task.strip():
+        return False, "Task cannot be empty."
+    if len(task) > MAX_TASK_LENGTH:
+        return False, f"Task too long. Max {MAX_TASK_LENGTH} characters."
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, task.lower()):
+            return False, "Task contains disallowed content."
+    return True, ""
 
 
 def run_agent(task: str, on_step=None) -> str:
-    """
-    Run the agent on a task.
-    on_step: optional callback(step_type, content) for streaming steps to UI
-    Returns the final answer string.
-    """
+    is_safe, reason = validate_task(task)
+    if not is_safe:
+        return f"❌ {reason}"
+
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task}
     ]
 
     if on_step:
-        on_step("task", f"Task received: {task}")
+        on_step("task", task)
 
     for iteration in range(MAX_ITERATIONS):
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=4096,
-            temperature=0.3,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                max_tokens=2048,
+                temperature=0.1,
+            )
+        except Exception as e:
+            error_str = str(e)
+            # Tool calling failed — answer directly without tools
+            if "tool_use_failed" in error_str or "Failed to call" in error_str:
+                if on_step:
+                    on_step("info", "Answering directly without tools")
+                try:
+                    direct = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=messages,
+                        max_tokens=2048,
+                        temperature=0.3,
+                    )
+                    answer = direct.choices[0].message.content or "I couldn't complete this task."
+                    if on_step:
+                        on_step("final", answer)
+                    return answer
+                except Exception as e2:
+                    error_msg = f"Error: {str(e2)}"
+                    if on_step:
+                        on_step("final", error_msg)
+                    return error_msg
+            error_msg = f"Error: {error_str}"
+            if on_step:
+                on_step("final", error_msg)
+            return error_msg
 
         msg = response.choices[0].message
         finish_reason = response.choices[0].finish_reason
 
-        # No more tool calls — agent is done
+        # No tool calls — this is the final answer
         if finish_reason == "stop" or not msg.tool_calls:
-            final = msg.content or "Task completed."
+            final = msg.content or "I completed the task."
             if on_step:
                 on_step("final", final)
             return final
 
-        # Process tool calls
+        # Add assistant message
         messages.append({
             "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                } for tc in msg.tool_calls
-            ]
+            "content": msg.content or "",
+            "tool_calls": [{
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
+            } for tc in msg.tool_calls]
         })
 
+        # Execute tools
         for tc in msg.tool_calls:
             tool_name = tc.function.name
             try:
@@ -95,17 +123,18 @@ def run_agent(task: str, on_step=None) -> str:
                 args = {}
 
             if on_step:
-                on_step("tool_call", f"Calling **{tool_name}** with: `{json.dumps(args, ensure_ascii=False)[:200]}`")
+                on_step("tool_call", f"Using {tool_name}: {json.dumps(args)[:150]}")
 
-            # Execute the tool
             if tool_name in TOOL_MAP:
-                result = TOOL_MAP[tool_name](**args)
+                try:
+                    result = TOOL_MAP[tool_name](**args)
+                except Exception as e:
+                    result = f"Tool error: {e}"
             else:
                 result = f"Unknown tool: {tool_name}"
 
             if on_step:
-                preview = str(result)[:300] + ("..." if len(str(result)) > 300 else "")
-                on_step("tool_result", f"Result from **{tool_name}**:\n```\n{preview}\n```")
+                on_step("tool_result", str(result)[:300])
 
             messages.append({
                 "role": "tool",
@@ -113,21 +142,32 @@ def run_agent(task: str, on_step=None) -> str:
                 "content": str(result)
             })
 
-    return "Snow reached maximum iterations. Task may be incomplete."
+    # Max iterations reached — get final answer from current context
+    try:
+        final_resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages + [{"role": "user", "content": "Please provide your final comprehensive answer now."}],
+            max_tokens=2048,
+            temperature=0.3,
+        )
+        final = final_resp.choices[0].message.content or "Task completed."
+        if on_step:
+            on_step("final", final)
+        return final
+    except Exception:
+        return "Snow reached maximum iterations. Please try a simpler task."
 
 
 if __name__ == "__main__":
-    print("Snow — Autonomous AI Agent — type 'quit' to exit\n")
+    print("❄️ Snow — type 'quit' to exit\n")
     while True:
         task = input("You: ").strip()
-        if task.lower() in ("quit", "exit"):
+        if task.lower() in ("quit", "exit", "q"):
             break
         if not task:
             continue
-
-        def print_step(step_type, content):
-            icons = {"task": "📋", "tool_call": "🔧", "tool_result": "📊", "final": "✅"}
-            print(f"\n{icons.get(step_type, '•')} {content}")
-
-        result = run_agent(task, on_step=print_step)
-        print(f"\n{'='*60}\nFinal Answer:\n{result}\n{'='*60}\n")
+        result = run_agent(task, on_step=lambda t, c: print(f"[{t}] {c[:200]}"))
+        print(f"\n❄️ {result}\n{'─'*50}\n")
+        
+    else:
+        print("Goodbye!")
