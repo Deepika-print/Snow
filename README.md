@@ -22,7 +22,7 @@
 <div align="center">
 
 ### Web UI
-![Snow Web UI](screenshots/Screenshot(105).png)
+![Snow Web UI](screenshots/screenshot-ui.png)
 
 ### WhatsApp Bot
 <img src="screenshots/whatsapp-1.jpg" width="45%"/>
